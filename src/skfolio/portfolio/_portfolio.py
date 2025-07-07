@@ -6,7 +6,7 @@ is the dot product of the assets weights with the assets returns.
 
 # Copyright (c) 2023
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# SPDX-License-Identifier: BSD-3-Clause
 
 import numbers
 from typing import ClassVar
@@ -14,7 +14,6 @@ from typing import ClassVar
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-import plotly.express as px
 
 import skfolio.typing as skt
 from skfolio.measures import RiskMeasure, effective_number_assets
@@ -147,6 +146,9 @@ class Portfolio(BasePortfolio):
     compounded : bool, default=False
         If this is set to True, cumulative returns are compounded.
         The default is `False`.
+
+    sample_weight : ndarray of shape (n_observations,), optional
+        Sample weights for each observation. If None, equal weights are assumed.
 
     min_acceptable_return : float, optional
         The minimum acceptable return used to distinguish "downside" and "upside"
@@ -413,6 +415,7 @@ class Portfolio(BasePortfolio):
         }
     )
 
+    # ruff: noqa: RUF023
     __slots__ = {
         # read-only
         "X",
@@ -442,6 +445,7 @@ class Portfolio(BasePortfolio):
         annualized_factor: float = 252,
         fitness_measures: list[skt.Measure] | None = None,
         compounded: bool = False,
+        sample_weight: np.ndarray | None = None,
         min_acceptable_return: float | None = None,
         value_at_risk_beta: float = 0.95,
         entropic_risk_measure_theta: float = 1,
@@ -541,6 +545,7 @@ class Portfolio(BasePortfolio):
             tag=tag,
             fitness_measures=fitness_measures,
             compounded=compounded,
+            sample_weight=sample_weight,
             risk_free_rate=risk_free_rate,
             annualized_factor=annualized_factor,
             min_acceptable_return=min_acceptable_return,
@@ -649,12 +654,12 @@ class Portfolio(BasePortfolio):
     # Custom attribute getter (read-only and cached)
     @cached_property_slots
     def nonzero_assets(self) -> np.ndarray:
-        """Invested asset :math:`abs(weights) > 0.001%`"""
+        """Invested asset :math:`abs(weights) > 0.001%`."""
         return self.assets[self.nonzero_assets_index]
 
     @cached_property_slots
     def nonzero_assets_index(self) -> np.ndarray:
-        """Indices of invested asset :math:`abs(weights) > 0.001%`"""
+        """Indices of invested asset :math:`abs(weights) > 0.001%`."""
         return np.flatnonzero(abs(self.weights) > _ZERO_THRESHOLD)
 
     @property
@@ -668,7 +673,20 @@ class Portfolio(BasePortfolio):
         return df
 
     @property
-    def diversification(self):
+    def weights_per_observation(self) -> pd.DataFrame:
+        """DataFrame of the Portfolio weights per observation."""
+        idx = self.nonzero_assets_index
+        weights = self.weights[idx]
+        assets = self.assets[idx]
+        df = pd.DataFrame(
+            np.ones((len(self.observations), len(assets))) * weights,
+            index=self.observations,
+            columns=assets,
+        )
+        return df
+
+    @property
+    def diversification(self) -> float:
         """Weighted average of volatility divided by the portfolio volatility."""
         return (
             self.weights @ np.std(np.asarray(self.X), axis=0) / self.standard_deviation
@@ -693,7 +711,7 @@ class Portfolio(BasePortfolio):
     @property
     def effective_number_assets(self) -> float:
         r"""Computes the effective number of assets, defined as the inverse of the
-        Herfindahl index [1]_:
+        Herfindahl index.
 
         .. math:: N_{eff} = \frac{1}{\Vert w \Vert_{2}^{2}}
 
@@ -750,8 +768,8 @@ class Portfolio(BasePortfolio):
         return float(self.weights @ assets_covariance @ self.weights.T)
 
     def contribution(
-        self, measure: skt.Measure, spacing: float | None = None
-    ) -> np.ndarray:
+        self, measure: skt.Measure, spacing: float | None = None, to_df: bool = False
+    ) -> np.ndarray | pd.DataFrame:
         r"""Compute the contribution of each asset to a given measure.
 
         Parameters
@@ -763,9 +781,15 @@ class Portfolio(BasePortfolio):
             Spacing "h" of the finite difference:
             :math:`contribution(wi)= \frac{measure(wi-h) - measure(wi+h)}{2h}`
 
+        to_df : bool, default=False
+            If set to True, a DataFrame with asset names in index is returned,
+            otherwise a numpy array is returned. When a DataFrame is returned, the
+            values are sorted in descending order and assets with zero weights are
+            removed.
+
         Returns
         -------
-        values : ndrray of shape (n_assets,)
+        values : numpy array of shape (n_assets,) or DataFrame
             The measure contribution of each asset.
         """
         if spacing is None:
@@ -778,49 +802,26 @@ class Portfolio(BasePortfolio):
                 spacing = 1e-1
             else:
                 spacing = 1e-5
-        args = {arg: getattr(self, arg) for arg in args_names(self.__init__)}
+        args = {
+            arg: getattr(self, arg)
+            for arg in args_names(self.__init__)
+            if arg != "weights"
+        }
 
-        def get_risk(i: int, h: float) -> float:
-            a = args.copy()
-            w = a["weights"].copy()
-            w[i] += h
-            a["weights"] = w
-            return getattr(Portfolio(**a), measure.value)
-
-        cont = [
-            (get_risk(i, h=spacing) - get_risk(i, h=-spacing))
-            / (2 * spacing)
-            * self.weights[i]
-            for i in range(len(self.weights))
-        ]
-        return np.array(cont)
-
-    def plot_contribution(self, measure: skt.Measure, spacing: float | None = None):
-        r"""Plot the contribution of each asset to a given measure.
-
-        Parameters
-        ----------
-        measure : Measure
-            The measure used for the contribution computation.
-
-        spacing : float, optional
-            Spacing "h" of the finite difference:
-            :math:`contribution(wi)= \frac{measure(wi-h) - measure(wi+h)}{2h}`
-
-        Returns
-        -------
-        plot : Figure
-            The plotly Figure of assets contribution to the measure.
-        """
-        cont = self.contribution(measure=measure, spacing=spacing)
-        df = pd.DataFrame(cont, index=self.assets, columns=["contribution"])
-        fig = px.bar(df, x=df.index, y=df.columns)
-        fig.update_layout(
-            title=f"{measure} contribution",
-            xaxis_title="Asset",
-            yaxis_title=f"{measure} contribution",
+        contribution, assets = _compute_contribution(
+            args=args,
+            weights=self.weights,
+            assets=self.assets,
+            measure=measure,
+            h=spacing,
+            drop_zero_weights=to_df,
         )
-        return fig
+
+        if not to_df:
+            return np.array(contribution)
+        df = pd.DataFrame(contribution, index=assets, columns=[self.name])
+        df.sort_values(by=self.name, ascending=False, inplace=True)
+        return df
 
     def summary(self, formatted: bool = True) -> pd.Series:
         """Portfolio summary of all its measures.
@@ -863,3 +864,44 @@ class Portfolio(BasePortfolio):
             return self.weights[np.where(self.assets == asset)[0][0]]
         except IndexError:
             raise IndexError("{asset} is not a valid asset name.") from None
+
+
+def _get_risk(
+    args: dict, weights: np.ndarray, measure: skt.Measure, i: int, h: float
+) -> float:
+    """Get the Portfolio risk measure when the weight of asset `i` is increased by `h`."""
+    assert "weights" not in args
+    weights = weights.copy()
+    weights[i] += h
+    return getattr(Portfolio(weights=weights, **args), measure.value)
+
+
+def _compute_contribution(
+    args: dict,
+    weights: np.ndarray,
+    assets: np.ndarray,
+    measure: skt.Measure,
+    h: float,
+    drop_zero_weights: bool,
+) -> tuple[list[float], list[str]]:
+    """Compute the contribution of each asset to a given measure using finite
+    difference.
+    """
+    contributions = []
+    _assets = []
+    for i, (weight, asset) in enumerate(zip(weights, assets, strict=True)):
+        if weight == 0:
+            if not drop_zero_weights:
+                _assets.append(asset)
+                contributions.append(0)
+        else:
+            _assets.append(asset)
+            contributions.append(
+                (
+                    _get_risk(args, weights, measure, i, h)
+                    - _get_risk(args, weights, measure, i, -h)
+                )
+                / (2 * h)
+                * weight
+            )
+    return contributions, _assets

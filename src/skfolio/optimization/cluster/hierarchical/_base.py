@@ -2,7 +2,7 @@
 
 # Copyright (c) 2023
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# SPDX-License-Identifier: BSD-3-Clause
 # Implementation derived from:
 # Riskfolio-Lib, Copyright (c) 2020-2023, Dany Cajas, Licensed under BSD 3 clause.
 # scikit-learn, Copyright (c) 2007-2010 David Cournapeau, Fabian Pedregosa, Olivier
@@ -20,7 +20,7 @@ from skfolio.distance import BaseDistance
 from skfolio.measures import ExtraRiskMeasure, RiskMeasure
 from skfolio.optimization._base import BaseOptimization
 from skfolio.portfolio import Portfolio
-from skfolio.prior import BasePrior, PriorModel
+from skfolio.prior import BasePrior, ReturnDistribution
 from skfolio.utils.tools import input_to_array
 
 
@@ -52,14 +52,12 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
             * ENTROPIC_RISK_MEASURE
             * FOURTH_CENTRAL_MOMENT
             * FOURTH_LOWER_PARTIAL_MOMENT
-            * SKEW
-            * KURTOSIS
 
         The default is `RiskMeasure.VARIANCE`.
 
     prior_estimator : BasePrior, optional
         :ref:`Prior estimator <prior>`.
-        The prior estimator is used to estimate the :class:`~skfolio.prior.PriorModel`
+        The prior estimator is used to estimate the :class:`~skfolio.prior.ReturnDistribution`
         containing the estimation of assets expected returns, covariance matrix and
         returns. The moments and returns estimations are used for the risk computation
         and the returns estimation are used by the distance matrix estimator.
@@ -80,12 +78,12 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
 
     min_weights : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
         Minimum assets weights (weights lower bounds). Negative weights are not allowed.
-        If a float is provided, it is applied to each asset. `None` is equivalent to
-        `-np.Inf` (no lower bound). If a dictionary is provided, its (key/value) pair
-        must be the (asset name/asset minium weight) and the input `X` of the `fit`
-        methods must be a DataFrame with the assets names in columns. When using a
-        dictionary, assets values that are not provided are assigned a minimum weight
-        of `0.0`. The default is 0.0 (no short selling).
+        If a float is provided, it is applied to each asset.
+        If a dictionary is provided, its (key/value) pair must be the
+        (asset name/asset minium weight) and the input `X` of the `fit` methods must be
+        a DataFrame with the assets names in columns.
+        When using a dictionary, assets values that are not provided are assigned a
+        minimum weight of `0.0`. The default is 0.0 (no short selling).
 
         Example:
 
@@ -96,12 +94,12 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
 
     max_weights : float | dict[str, float] | array-like of shape (n_assets, ), default=1.0
         Maximum assets weights (weights upper bounds). Weights above 1.0 are not
-        allowed. If a float is provided, it is applied to each asset. `None` is
-        equivalent to `+np.Inf` (no upper bound). If a dictionary is provided, its
-        (key/value) pair must be the (asset name/asset maximum weight) and the input `X`
-        of the `fit` method must be a DataFrame with the assets names in columns. When
-        using a dictionary, assets values that are not provided are assigned a minimum
-        weight of `1.0`. The default is 1.0 (each asset is below 100%).
+        allowed. If a float is provided, it is applied to each asset.
+        If a dictionary is provided, its (key/value) pair must be the
+        (asset name/asset maximum weight) and the input `X` of the `fit` method must be
+        a DataFrame with the assets names in columns.
+        When using a dictionary, assets values that are not provided are assigned a
+        minimum weight of `1.0`. The default is 1.0 (each asset is below 100%).
 
         Example:
 
@@ -137,7 +135,7 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
             needs to be homogenous to the periodicity of :math:`\mu`. For example, if
             the input `X` is composed of **daily** returns, the `transaction_costs` need
             to be expressed as **daily** costs.
-            (See :ref:`sphx_glr_auto_examples_1_mean_risk_plot_6_transaction_costs.py`)
+            (See :ref:`sphx_glr_auto_examples_mean_risk_plot_6_transaction_costs.py`)
 
     management_fees : float | dict[str, float] | array-like of shape (n_assets, ), default=0.0
         Management fees of the assets. It is used to add linear management fees to the
@@ -282,7 +280,7 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
     def _risk(
         self,
         weights: np.ndarray,
-        prior_model: PriorModel,
+        return_distribution: ReturnDistribution,
     ) -> float:
         """Compute the risk measure of a theoretical portfolio defined by the weights
         vector.
@@ -292,8 +290,8 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
         weights : ndarray of shape (n_assets,)
            The vector of weights.
 
-        prior_model : PriorModel
-            The prior model of the assets distribution.
+        return_distribution : ReturnDistribution
+            The assets return distribution.
 
         Returns
         -------
@@ -302,36 +300,39 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
             vector.
         """
         ptf = Portfolio(
-            X=prior_model.returns,
+            X=return_distribution.returns,
+            sample_weight=return_distribution.sample_weight,
             weights=weights,
             transaction_costs=self.transaction_costs,
             management_fees=self.management_fees,
             previous_weights=self.previous_weights,
         )
         if self.risk_measure in [RiskMeasure.VARIANCE, RiskMeasure.STANDARD_DEVIATION]:
-            risk = ptf.variance_from_assets(assets_covariance=prior_model.covariance)
+            risk = ptf.variance_from_assets(
+                assets_covariance=return_distribution.covariance
+            )
             if self.risk_measure == RiskMeasure.STANDARD_DEVIATION:
                 risk = np.sqrt(risk)
         else:
             risk = getattr(ptf, str(self.risk_measure.value))
         return risk
 
-    def _unitary_risks(self, prior_model: PriorModel) -> np.ndarray:
+    def _unitary_risks(self, return_distribution: ReturnDistribution) -> np.ndarray:
         """Compute the vector of risk measure for each single assets.
 
         Parameters
         ----------
-        prior_model : PriorModel
-            The prior model of the assets distribution.
+        return_distribution : ReturnDistribution
+            The asset returns distribution.
 
         Returns
         -------
         values: ndarray of shape (n_assets,)
             The risk measure of each asset.
         """
-        n_assets = prior_model.returns.shape[1]
+        n_assets = return_distribution.returns.shape[1]
         risks = [
-            self._risk(weights=weights, prior_model=prior_model)
+            self._risk(weights=weights, return_distribution=return_distribution)
             for weights in np.identity(n_assets)
         ]
         return np.array(risks)
@@ -351,7 +352,6 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
         max_weights : ndarray of shape (n_assets,)
             The weight upper bound 1D array.
         """
-
         if self.min_weights is None:
             min_weights = np.zeros(n_assets)
         else:
@@ -387,57 +387,6 @@ class BaseHierarchicalOptimization(BaseOptimization, ABC):
             )
 
         return min_weights, max_weights
-
-    @staticmethod
-    def _apply_weight_constraints_to_alpha(
-        alpha: float,
-        max_weights: np.ndarray,
-        min_weights: np.ndarray,
-        weights: np.ndarray,
-        left_cluster: np.ndarray,
-        right_cluster: np.ndarray,
-    ) -> float:
-        """Apply weight constraints to the alpha multiplication factor of the
-        Hierarchical Tree Clustering algorithm.
-
-        Parameters
-        ----------
-        alpha : float
-            The alpha multiplication factor of the Hierarchical Tree Clustering
-            algorithm.
-
-         min_weights : ndarray of shape (n_assets,)
-            The weight lower bound 1D array.
-
-        max_weights : ndarray of shape (n_assets,)
-            The weight upper bound 1D array.
-
-        weights : np.ndarray of shape (n_assets,)
-            The assets weights.
-
-        left_cluster : ndarray of shape (n_left_cluster,)
-            Indices of the left cluster weights.
-
-        right_cluster : ndarray of shape (n_right_cluster,)
-            Indices of the right cluster weights.
-
-        Returns
-        -------
-        value : float
-            The transformed alpha incorporating the weight constraints.
-        """
-        alpha = min(
-            np.sum(max_weights[left_cluster]) / weights[left_cluster[0]],
-            max(np.sum(min_weights[left_cluster]) / weights[left_cluster[0]], alpha),
-        )
-        alpha = 1 - min(
-            np.sum(max_weights[right_cluster]) / weights[right_cluster[0]],
-            max(
-                np.sum(min_weights[right_cluster]) / weights[right_cluster[0]],
-                1 - alpha,
-            ),
-        )
-        return alpha
 
     def get_metadata_routing(self):
         # noinspection PyTypeChecker

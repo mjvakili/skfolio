@@ -11,7 +11,7 @@ def test_views_to_matrix(X):
     views = ["AAPL - BBY == 0.03 ", "CVX - KO== 0.04", "MSFT == 0.06 "]
     groups = np.array([X.columns])
 
-    picking_matrix, views = equations_to_matrix(
+    picking_matrix, views, _, _ = equations_to_matrix(
         groups=groups, equations=views, sum_to_one=True
     )
     np.testing.assert_almost_equal(
@@ -98,7 +98,7 @@ def test_black_litterman(X):
     assert np.all(model.groups_ == np.asarray(X.columns))
     assert np.all(model.views_ == np.array([0.03, 0.04, 0.06]))
     assert model.picking_matrix_.shape == (3, 20)
-    res = model.prior_model_
+    res = model.return_distribution_
     assert hash(res)
     assert res.mu.shape == (20,)
     assert res.covariance.shape == (20, 20)
@@ -589,9 +589,11 @@ def test_black_litterman(X):
     }
     model2 = BlackLitterman(views=views, groups=groups, tau=1 / n_observations)
     model2.fit(X)
-    np.testing.assert_almost_equal(model2.prior_model_.mu, model.prior_model_.mu)
     np.testing.assert_almost_equal(
-        model2.prior_model_.covariance, model.prior_model_.covariance
+        model2.return_distribution_.mu, model.return_distribution_.mu
+    )
+    np.testing.assert_almost_equal(
+        model2.return_distribution_.covariance, model.return_distribution_.covariance
     )
 
 
@@ -607,7 +609,7 @@ def test_black_litterman_factor_model(X, y):
     )
 
     model.fit(X, y)
-    assert model.prior_model_.covariance.shape == (20, 20)
+    assert model.return_distribution_.covariance.shape == (20, 20)
 
 
 def test_metadata_routing(X, implied_vol):

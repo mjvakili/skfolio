@@ -5,7 +5,7 @@
 
 # Copyright (c) 2023
 # Author: Hugo Delatte <delatte.hugo@gmail.com>
-# License: BSD 3 clause
+# SPDX-License-Identifier: BSD-3-Clause
 
 import numbers
 from collections.abc import Iterator
@@ -62,6 +62,9 @@ class MultiPeriodPortfolio(BasePortfolio):
     compounded : bool, default=False
         If this is set to True, cumulative returns are compounded.
         The default is `False`.
+
+    sample_weight : ndarray of shape (n_observations,), optional
+        Sample weights for each observation. If None, equal weights are assumed.
 
     min_acceptable_return : float, optional
         The minimum acceptable return used to distinguish "downside" and "upside"
@@ -334,6 +337,7 @@ class MultiPeriodPortfolio(BasePortfolio):
         annualized_factor: float = 252.0,
         fitness_measures: list[skt.Measure] | None = None,
         compounded: bool = False,
+        sample_weight: np.ndarray | None = None,
         min_acceptable_return: float | None = None,
         value_at_risk_beta: float = 0.95,
         entropic_risk_measure_theta: float = 1,
@@ -354,6 +358,7 @@ class MultiPeriodPortfolio(BasePortfolio):
             annualized_factor=annualized_factor,
             fitness_measures=fitness_measures,
             compounded=compounded,
+            sample_weight=sample_weight,
             min_acceptable_return=min_acceptable_return,
             value_at_risk_beta=value_at_risk_beta,
             cvar_beta=cvar_beta,
@@ -538,7 +543,8 @@ class MultiPeriodPortfolio(BasePortfolio):
     @portfolios.setter
     def portfolios(self, value: list[Portfolio] | None = None):
         """Set the list of Portfolios and clear the attributes cache linked to the
-        list of portfolios."""
+        list of portfolios.
+        """
         self._set_portfolios(portfolios=value)
         self.clear()
 
@@ -552,6 +558,51 @@ class MultiPeriodPortfolio(BasePortfolio):
     def composition(self) -> pd.DataFrame:
         """DataFrame of the Portfolio composition."""
         df = pd.concat([p.composition for p in self], axis=1)
+        df.fillna(0, inplace=True)
+        df.columns = deduplicate_names(df.columns)
+        return df
+
+    @property
+    def weights_per_observation(self) -> pd.DataFrame:
+        """DataFrame of the Portfolio weights per observation."""
+        return (
+            pd.concat([p.weights_per_observation for p in self], axis=0)
+            .fillna(0)
+            .sort_index()
+        )
+
+    def contribution(
+        self, measure: skt.Measure, spacing: float | None = None, to_df: bool = True
+    ) -> np.ndarray | pd.DataFrame:
+        r"""Compute the contribution of each asset to a given measure for each
+        portfolio.
+
+        Parameters
+        ----------
+        measure : Measure
+            The measure used for the contribution computation.
+
+        spacing : float, optional
+            Spacing "h" of the finite difference:
+            :math:`contribution(wi)= \frac{measure(wi-h) - measure(wi+h)}{2h}`
+
+        to_df : bool, default=False
+            If this is set to True, a DataFrame with asset names in index and portfolio
+            names in columns is returned, otherwise a list of numpy array is returned.
+            When a DataFrame is returned, the assets with zero weights are removed.
+
+        Returns
+        -------
+        values : list of numpy array of shape (n_assets,) for each portfolio or a DataFrame
+            The measure contribution of each asset for each portfolio.
+        """
+        contributions = [
+            ptf.contribution(measure=measure, spacing=spacing, to_df=to_df)
+            for ptf in self
+        ]
+        if not to_df:
+            return contributions
+        df = pd.concat(contributions, axis=1)
         df.fillna(0, inplace=True)
         df.columns = deduplicate_names(df.columns)
         return df

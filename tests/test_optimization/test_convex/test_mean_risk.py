@@ -2,7 +2,7 @@ import cvxpy as cp
 import numpy as np
 import pytest
 import sklearn.model_selection as sks
-from sklearn import config_context
+from sklearn import clone, config_context
 
 from skfolio import (
     MultiPeriodPortfolio,
@@ -14,7 +14,13 @@ from skfolio import (
 from skfolio.model_selection import cross_val_predict
 from skfolio.moments import EmpiricalMu, ImpliedCovariance
 from skfolio.optimization import MeanRisk, ObjectiveFunction
-from skfolio.prior import BlackLitterman, EmpiricalPrior, FactorModel
+from skfolio.optimization.convex._mean_risk import _optimal_homogenization_factor
+from skfolio.prior import (
+    BlackLitterman,
+    EmpiricalPrior,
+    EntropyPooling,
+    FactorModel,
+)
 from skfolio.uncertainty_set import (
     EmpiricalCovarianceUncertaintySet,
     EmpiricalMuUncertaintySet,
@@ -148,7 +154,7 @@ def mean_risk_params_linear_constraints(request, groups, linear_constraints):
     params=[True, False],
 )
 def mean_risk_params_inequalities(request, groups, linear_constraints):
-    left_inequality, right_inequality = equations_to_matrix(
+    _, _, left_inequality, right_inequality = equations_to_matrix(
         groups=np.array(groups), equations=linear_constraints
     )
     if request.param:
@@ -174,12 +180,16 @@ def test_cvx_cache(X):
     factor = cp.Constant(1)
     model._clear_models_cache()
     res = model._cvx_drawdown(
-        prior_model=model.prior_estimator_.prior_model_, w=w, factor=factor
+        return_distribution=model.prior_estimator_.return_distribution_,
+        w=w,
+        factor=factor,
     )
     a = res[0]
     assert len(res[1]) != 0
     res = model._cvx_drawdown(
-        prior_model=model.prior_estimator_.prior_model_, w=w, factor=factor
+        return_distribution=model.prior_estimator_.return_distribution_,
+        w=w,
+        factor=factor,
     )
     b = res[0]
     assert len(res[1]) == 0
@@ -187,12 +197,18 @@ def test_cvx_cache(X):
     assert hash(a) == hash(b)
     model._clear_models_cache()
     assert len(model._cvx_cache) == 0
-    res = model._cvx_returns(prior_model=model.prior_estimator_.prior_model_, w=w)
+    res = model._cvx_returns(
+        return_distribution=model.prior_estimator_.return_distribution_, w=w
+    )
     assert "_cvx_returns" in model._cvx_cache
-    res2 = model._cvx_returns(prior_model=model.prior_estimator_.prior_model_, w=w)
+    res2 = model._cvx_returns(
+        return_distribution=model.prior_estimator_.return_distribution_, w=w
+    )
     assert hash(res) == hash(res2)
     model._clear_models_cache()
-    res3 = model._cvx_returns(prior_model=model.prior_estimator_.prior_model_, w=w)
+    res3 = model._cvx_returns(
+        return_distribution=model.prior_estimator_.return_distribution_, w=w
+    )
     assert hash(res) != hash(res3)
 
 
@@ -446,6 +462,7 @@ def test_mean_risk_utility2(
     np.testing.assert_almost_equal(p_utility, utility, precision)
 
 
+@pytest.mark.filterwarnings("ignore:Solution may be inaccurate")
 def test_mean_risk_ratio(
     X,
     precisions,
@@ -495,6 +512,33 @@ def test_mean_risk_ratio2(
     np.testing.assert_almost_equal(
         p.mean, model.problem_values_["expected_return"], precision
     )
+
+
+def test_mean_risk_ratio_convergence(
+    X,
+    risk_measure,
+):
+    if risk_measure == RiskMeasure.VARIANCE:
+        risk_measure_verify = RiskMeasure.STANDARD_DEVIATION
+    elif risk_measure == RiskMeasure.SEMI_VARIANCE:
+        risk_measure_verify = RiskMeasure.SEMI_DEVIATION
+    else:
+        risk_measure_verify = risk_measure
+
+    # Maximize ratio
+    model = MeanRisk(
+        objective_function=ObjectiveFunction.MAXIMIZE_RATIO, risk_measure=risk_measure
+    )
+    p = model.fit_predict(X)
+    ratio = p.mean / getattr(p, risk_measure_verify)
+
+    model = MeanRisk(
+        risk_measure=risk_measure,
+        efficient_frontier_size=30,
+    )
+    pop = model.fit_predict(X)
+    expected_ratio = max([p.mean / getattr(p, risk_measure_verify) for p in pop])
+    np.testing.assert_almost_equal(ratio, expected_ratio, 4)
 
 
 def test_mean_risk_feature_names_in_(X):
@@ -551,13 +595,11 @@ def test_mean_risk_predict(X):
 
     model = MeanRisk(min_return=[0.0005, 0.0001])
     model.fit(X)
-    print(model.weights_)
     population = model.predict(X)
     assert isinstance(population, Population)
 
     model = MeanRisk(min_return=[0.0005, 0.0001], max_cdar=0.15)
     model.fit(X.to_numpy())
-    print(model.weights_)
     population = model.predict(X.to_numpy())
     assert isinstance(population, Population)
     assert population[0].cdar <= 0.15
@@ -571,6 +613,7 @@ def test_mean_risk_predict(X):
     assert population.measures_mean(RatioMeasure.SHARPE_RATIO) == sharpe
 
 
+@pytest.mark.filterwarnings("ignore:Solution may be inaccurate")
 def test_regularization(X, risk_measure, mean_risk_params_coef):
     diff = 0.01
 
@@ -764,6 +807,7 @@ def test_transaction_costs(X, risk_measure):
     assert abs(p_ref.weights - p.weights).sum() > above
 
 
+@pytest.mark.filterwarnings("ignore:Solution may be inaccurate")
 def test_mean_risk_methods(X, risk_measure, precisions):
     n_assets = X.shape[1]
     target_risk_arg = f"max_{risk_measure.value}"
@@ -860,24 +904,23 @@ def test_groups(X, groups, linear_constraints):
     model.fit(X)
     w3 = model.weights_
     p3 = model.fit_predict(X)
-    try:
+    with pytest.raises(ValueError):
         model.fit(np.array(X))
-        raise
-    except ValueError:
-        pass
     np.testing.assert_almost_equal(w1, w3)
     np.testing.assert_almost_equal(p1.returns, p2.returns)
     np.testing.assert_almost_equal(p1.returns, p3.returns)
 
 
-def test_tracking_error(X, y):
-    model = MeanRisk(max_tracking_error=0.005)
+@pytest.mark.parametrize(
+    "objective_function",
+    list(ObjectiveFunction),
+)
+def test_tracking_error(X, y, objective_function):
+    model = MeanRisk(max_tracking_error=0.005, objective_function=objective_function)
     bench = y["SIZE"]
     p = model.fit(X, bench).predict(X)
-    tracking_error = np.sqrt(
-        np.sum((p.returns - np.asarray(bench)) ** 2) / (len(p.returns) - 1)
-    )
-    np.testing.assert_almost_equal(tracking_error, 0.005)
+    tracking_error = np.std(p.returns - np.asarray(bench), ddof=1)
+    np.testing.assert_almost_equal(tracking_error, 0.005, 4)
 
 
 def test_turnover(X, y):
@@ -908,8 +951,9 @@ def test_optimization_factor_black_litterman(X, y):
         ),
     )
     model.fit(X, y)
+
     np.testing.assert_almost_equal(
-        model.prior_estimator_.prior_model_.mu,
+        model.prior_estimator_.return_distribution_.mu,
         np.array(
             [
                 0.04573766,
@@ -936,9 +980,12 @@ def test_optimization_factor_black_litterman(X, y):
         ),
     )
 
-    assert model.prior_estimator_.prior_model_.covariance.shape == (n_assets, n_assets)
+    assert model.prior_estimator_.return_distribution_.covariance.shape == (
+        n_assets,
+        n_assets,
+    )
     np.testing.assert_almost_equal(
-        model.prior_estimator_.prior_model_.covariance[:5, 15:],
+        model.prior_estimator_.return_distribution_.covariance[:5, 15:],
         np.array(
             [
                 [
@@ -984,26 +1031,26 @@ def test_optimization_factor_black_litterman(X, y):
         model.weights_,
         np.array(
             [
-                3.23889556e-09,
-                4.37353839e-01,
-                3.50041391e-09,
-                3.55794921e-09,
-                3.73876428e-09,
-                4.67673649e-09,
-                3.69469609e-09,
-                2.81118740e-09,
-                3.57468357e-09,
-                2.36272378e-09,
-                2.51196427e-09,
-                3.73429426e-09,
-                3.55000669e-09,
-                2.69088597e-09,
-                2.56698189e-09,
-                2.84579902e-09,
-                5.62646099e-01,
-                3.55289624e-09,
-                5.57309135e-09,
-                4.32763989e-09,
+                1.62857662e-07,
+                4.37311645e-01,
+                1.70851913e-07,
+                1.74681445e-07,
+                1.82980089e-07,
+                2.27049027e-07,
+                1.81306482e-07,
+                1.41037623e-07,
+                1.74161120e-07,
+                1.17167647e-07,
+                1.25107214e-07,
+                1.86784735e-07,
+                1.76837448e-07,
+                1.32631685e-07,
+                1.27994694e-07,
+                1.41842812e-07,
+                5.62685258e-01,
+                1.73411036e-07,
+                2.88100847e-07,
+                2.12103015e-07,
             ]
         ),
     )
@@ -1026,3 +1073,560 @@ def test_metadata_routing(X_small, implied_vol_small):
 
     # noinspection PyUnresolvedReferences
     assert model.prior_estimator_.covariance_estimator_.r2_scores_.shape == (20,)
+
+
+def test_mean_risk_linear_constraints_equalities(X):
+    model = MeanRisk(
+        objective_function=ObjectiveFunction.MINIMIZE_RISK,
+        risk_measure=RiskMeasure.VARIANCE,
+        linear_constraints=["AMD == 0.2", "UNH==0.6"],
+    )
+    model.fit(X)
+    np.testing.assert_almost_equal(model.weights_[1], 0.2)
+    np.testing.assert_almost_equal(model.weights_[17], 0.6)
+
+
+@pytest.mark.parametrize(
+    "objective_function,expected",
+    [
+        [
+            ObjectiveFunction.MINIMIZE_RISK,
+            np.array(
+                [
+                    0.0,
+                    -0.00469256,
+                    -0.02999935,
+                    -0.00117959,
+                    -0.02999905,
+                    0.0044902,
+                    0.01449584,
+                    0.19907001,
+                    0.0,
+                    0.18284598,
+                    0.0,
+                    0.17085667,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.10682524,
+                    0.0,
+                    0.0,
+                    0.19999798,
+                    0.08728863,
+                ]
+            ),
+        ],
+        [
+            ObjectiveFunction.MAXIMIZE_RATIO,
+            np.array(
+                [
+                    0.0,
+                    0.19265922,
+                    -0.03,
+                    -0.03,
+                    -0.00060139,
+                    -0.03,
+                    -0.02431516,
+                    -0.03,
+                    0.0,
+                    0.0,
+                    0.2,
+                    0.2,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.2,
+                    0.05989742,
+                    0.1923599,
+                    0.0,
+                    0.0,
+                ]
+            ),
+        ],
+    ],
+)
+def test_group_cardinalities_constraint(X, groups, objective_function, expected):
+    group_cardinalities = {"Equity": 2, "Bond": 5, "US": 1}
+
+    model = MeanRisk(
+        objective_function=objective_function,
+        min_weights=-0.03,
+        max_weights=0.2,
+        budget=0.9,
+        group_cardinalities=group_cardinalities,
+        groups=groups,
+        solver="SCIP",
+    )
+    model.fit(X)
+    w = model.weights_
+    assert np.sum(abs(w) > 1e-10) == 12
+    np.testing.assert_almost_equal(np.sum(w), 0.9)
+    assert np.max(w) - 0.2 <= 1e-8
+    assert np.min(w) + 0.03 >= -1e-8
+    np.testing.assert_almost_equal(w, expected, 2)
+
+
+@pytest.mark.parametrize(
+    "objective_function",
+    [ObjectiveFunction.MINIMIZE_RISK, ObjectiveFunction.MAXIMIZE_RATIO],
+)
+def test_cardinality_and_group_cardinalities_constraint(X, groups, objective_function):
+    group_cardinalities = {"Equity": 2, "Bond": 5, "US": 1}
+
+    model = MeanRisk(
+        objective_function=objective_function,
+        min_weights=-0.03,
+        max_weights=0.2,
+        budget=0.9,
+        group_cardinalities=group_cardinalities,
+        cardinality=10,
+        groups=groups,
+        solver="SCIP",
+    )
+    model.fit(X)
+    w = model.weights_
+    assert np.sum(abs(w) > 1e-10) == 10
+    np.testing.assert_almost_equal(np.sum(w), 0.9)
+    assert np.max(w) - 0.2 <= 1e-8
+    assert np.min(w) + 0.03 >= -1e-8
+
+
+@pytest.mark.parametrize(
+    "objective_function",
+    [ObjectiveFunction.MINIMIZE_RISK, ObjectiveFunction.MAXIMIZE_RATIO],
+)
+@pytest.mark.parametrize("cardinality", [7, 11, 15, 20])
+def test_cardinality_constraint(X, objective_function, cardinality):
+    max_weights = 1 / (cardinality - 2)
+    model = MeanRisk(
+        objective_function=objective_function,
+        min_weights=-0.03,
+        max_weights=max_weights,
+        budget=0.9,
+        cardinality=cardinality,
+        solver="SCIP",
+    )
+    model.fit(X)
+    w = model.weights_
+    assert np.sum(abs(w) > 1e-10) == cardinality
+    np.testing.assert_almost_equal(np.sum(w), 0.9)
+    assert np.max(w) - max_weights <= 1e-6
+    assert np.min(w) + 0.03 >= -1e-6
+
+
+def test_cardinality_constraint_ratio_convergence(X):
+    risk_measure = RiskMeasure.STANDARD_DEVIATION
+
+    model = MeanRisk(
+        objective_function=ObjectiveFunction.MAXIMIZE_RATIO,
+        min_weights=-0.03,
+        max_weights=0.2,
+        budget=0.9,
+        cardinality=7,
+        risk_measure=risk_measure,
+        solver="SCIP",
+    )
+    p = model.fit_predict(X)
+    ratio = p.mean / getattr(p, risk_measure)
+
+    model = MeanRisk(
+        risk_measure=risk_measure,
+        min_weights=-0.03,
+        max_weights=0.2,
+        budget=0.9,
+        cardinality=7,
+        efficient_frontier_size=20,
+        solver="SCIP",
+    )
+    pop = model.fit_predict(X)
+    expected_ratio = max([p.mean / getattr(p, risk_measure) for p in pop])
+    np.testing.assert_almost_equal(ratio, expected_ratio, 4)
+
+
+def test_scip_clarabel_convergence(X):
+    model = MeanRisk(
+        min_weights=0,
+        max_weights=0.8,
+        budget=0.9,
+    )
+    model.fit(X)
+    w1 = model.weights_
+    # noinspection PyTypeChecker
+    model.set_params(solver="SCIP")
+    model.fit(X)
+    w2 = model.weights_
+
+    np.testing.assert_array_almost_equal(w1, w2, 4)
+
+
+@pytest.mark.parametrize(
+    "objective_function",
+    [ObjectiveFunction.MINIMIZE_RISK, ObjectiveFunction.MAXIMIZE_RATIO],
+)
+def test_mip_threshold_constraints_long(X, objective_function):
+    model = MeanRisk(
+        risk_measure=RiskMeasure.STANDARD_DEVIATION,
+        objective_function=objective_function,
+        max_weights=0.15,
+        solver="SCIP",
+    )
+    model.fit(X)
+    w1 = model.weights_
+
+    threshold_long = 0.05
+    assert np.any((w1 < threshold_long - 1e-8) & (w1 > 0 + 1e-8))
+    # noinspection PyTypeChecker
+    model.set_params(threshold_long=threshold_long)
+    model.fit(X)
+    w2 = model.weights_
+    assert not np.any((w2 < threshold_long - 1e-8) & (w2 > 0 + 1e-8))
+    np.testing.assert_almost_equal(np.sum(w2), 1)
+    assert np.max(w2) - 0.15 <= 1e-8
+    assert np.min(w2) >= -1e-8
+
+
+@pytest.mark.parametrize(
+    "objective_function",
+    [ObjectiveFunction.MINIMIZE_RISK, ObjectiveFunction.MAXIMIZE_RATIO],
+)
+def test_mip_threshold_constraints_long_short(X, objective_function):
+    model = MeanRisk(
+        risk_measure=RiskMeasure.STANDARD_DEVIATION,
+        objective_function=objective_function,
+        min_weights=-0.8,
+        max_weights=0.8,
+        budget=0.5,
+        solver="SCIP",
+    )
+    model.fit(X)
+    w1 = model.weights_
+
+    threshold_long = 0.05
+    threshold_short = -0.03
+
+    assert np.any((w1 < threshold_long - 1e-8) & (w1 > 0 + 1e-8))
+    assert np.any((w1 > threshold_short + 1e-8) & (w1 < 0 - 1e-8))
+    # noinspection PyTypeChecker
+    model.set_params(threshold_long=threshold_long)
+    with pytest.raises(
+        ValueError,
+        match="When 'threshold_long' is provided*",
+    ):
+        model.fit(X)
+    # noinspection PyTypeChecker
+    model.set_params(threshold_long=threshold_long, threshold_short=threshold_short)
+    model.fit(X)
+    w2 = model.weights_
+
+    assert not np.any((w2 < threshold_long - 1e-8) & (w2 > 0 + 1e-8))
+    assert not np.any((w2 > threshold_short + 1e-8) & (w2 < 0 - 1e-8))
+    np.testing.assert_almost_equal(np.sum(w2), 0.5)
+    assert np.max(w2) - 0.8 <= 1e-8
+    assert np.min(w2) + 0.8 >= -1e-8
+
+
+@pytest.mark.parametrize(
+    "mu,expected",
+    [
+        [np.array([1, 2, 3]), 2.0],
+        [np.array([-1, -2, -3]), 2.0],
+        [np.array([1000, 2000, 3000]), 1e3],
+        [np.array([0, -2e-4, 3e-4]), 1e-3],
+    ],
+)
+def test_optimal_homogenization_factor(mu, expected):
+    res = _optimal_homogenization_factor(mu)
+    assert res == expected
+
+
+def test_mip_cardinality_and_threshold_constraints_long_short(X):
+    model = MeanRisk(
+        risk_measure=RiskMeasure.STANDARD_DEVIATION,
+        objective_function=ObjectiveFunction.MAXIMIZE_RATIO,
+        min_weights=-0.8,
+        max_weights=0.8,
+        budget=0.5,
+        solver="SCIP",
+    )
+    model.fit(X)
+    w = model.weights_
+
+    cardinality = 10
+    threshold_long = 0.05
+    threshold_short = -0.03
+
+    assert np.sum(abs(w) > 1e-10) == 20
+    assert np.any((w < threshold_long - 1e-8) & (w > 0 + 1e-8))
+    assert np.any((w > threshold_short + 1e-8) & (w < 0 - 1e-8))
+
+    # noinspection PyTypeChecker
+    model.set_params(
+        cardinality=cardinality,
+        threshold_long=threshold_long,
+        threshold_short=threshold_short,
+    )
+    model.fit(X)
+    w = model.weights_
+
+    assert np.sum(abs(w) > 1e-10) == cardinality
+    assert not np.any((w < threshold_long - 1e-8) & (w > 0 + 1e-8))
+    assert not np.any((w > threshold_short + 1e-8) & (w < 0 - 1e-8))
+    np.testing.assert_almost_equal(np.sum(w), 0.5)
+    assert np.max(w) - 0.8 <= 1e-8
+    assert np.min(w) + 0.8 >= -1e-8
+
+
+def test_optim_with_equal_weighted_sample_weight(X, risk_measure):
+    """No sample weight and equal-weighted sample weight should give the same result"""
+    ref = MeanRisk(risk_measure=risk_measure)
+    ref.fit(X)
+
+    model = MeanRisk(risk_measure=risk_measure, prior_estimator=EntropyPooling())
+    model.fit(X)
+
+    np.testing.assert_almost_equal(model.weights_, ref.weights_, 6)
+
+
+@pytest.mark.parametrize(
+    "risk_measure,view_params,expected_weights",
+    [
+        (
+            RiskMeasure.CVAR,
+            dict(cvar_views=["PG == 0.05"]),
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.12992,
+                0.0,
+                0.0,
+                0.0,
+                0.43883,
+                0.0,
+                0.0,
+                0.09788,
+                0.0,
+                0.06918,
+                0.01264,
+                0.25155,
+                0.0,
+            ],
+        ),
+        (
+            RiskMeasure.MEAN_ABSOLUTE_DEVIATION,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.0,
+                0.0035,
+                0.0,
+                0.00019,
+                0.0,
+                0.0,
+                0.0414,
+                0.18666,
+                0.0,
+                0.23537,
+                0.0,
+                0.21898,
+                0.0,
+                0.0,
+                0.00728,
+                0.0,
+                0.0,
+                0.00247,
+                0.23798,
+                0.06616,
+            ],
+        ),
+        (
+            RiskMeasure.VARIANCE,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.18293,
+                0.0,
+                0.26654,
+                0.0,
+                0.40648,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.09778,
+                0.04628,
+            ],
+        ),
+        (
+            RiskMeasure.STANDARD_DEVIATION,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.18297,
+                0.0,
+                0.26666,
+                0.0,
+                0.4065,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.09772,
+                0.04614,
+            ],
+        ),
+        (
+            RiskMeasure.SEMI_DEVIATION,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.27054,
+                0.0,
+                0.04966,
+                0.0,
+                0.38977,
+                0.0,
+                0.0,
+                0.02559,
+                0.0,
+                0.04024,
+                0.0,
+                0.2242,
+                0.0,
+            ],
+        ),
+        (
+            RiskMeasure.SEMI_VARIANCE,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.27054,
+                0.0,
+                0.04966,
+                0.0,
+                0.38977,
+                0.0,
+                0.0,
+                0.02559,
+                0.0,
+                0.04024,
+                0.0,
+                0.2242,
+                0.0,
+            ],
+        ),
+        (
+            RiskMeasure.FIRST_LOWER_PARTIAL_MOMENT,
+            dict(variance_views=["PG == 0.0005"]),
+            [
+                0.0,
+                0.0035,
+                0.0,
+                0.00019,
+                0.0,
+                0.0,
+                0.0414,
+                0.18666,
+                0.0,
+                0.23537,
+                0.0,
+                0.21898,
+                0.0,
+                0.0,
+                0.00728,
+                0.0,
+                0.0,
+                0.00247,
+                0.23798,
+                0.06616,
+            ],
+        ),
+    ],
+)
+def test_sample_weight(X, risk_measure, view_params, expected_weights):
+    ref = MeanRisk(risk_measure=risk_measure)
+    ref.fit(X)
+
+    model = clone(ref)
+    model = model.set_params(prior_estimator=EntropyPooling(**view_params))
+    model.fit(X)
+
+    assert model.weights_[15] < ref.weights_[15]
+
+    np.testing.assert_almost_equal(model.weights_, expected_weights, 4)
+
+    ref_ptf = ref.predict(X)
+    ptf = model.predict(X)
+
+    assert getattr(ref_ptf, risk_measure.value) < getattr(ptf, risk_measure.value)
+
+    sample_weight = model.prior_estimator_.return_distribution_.sample_weight
+
+    ref_ptf.sample_weight = sample_weight
+    ptf.sample_weight = sample_weight
+
+    assert getattr(ref_ptf, risk_measure.value) > getattr(ptf, risk_measure.value)
+
+
+def test_max_ratio_with_neg_f1(X):
+    model = MeanRisk(
+        objective_function=ObjectiveFunction.MAXIMIZE_RATIO, risk_free_rate=0.002
+    )
+    model.fit(X)
+
+    with pytest.raises(
+        ValueError, match="Cannot optimize for Maximum Ratio with your current"
+    ):
+        model = MeanRisk(
+            objective_function=ObjectiveFunction.MAXIMIZE_RATIO, risk_free_rate=0.0025
+        )
+        model.fit(X)
+
+
+def test_predict_with_distribution(X):
+    model = MeanRisk()
+    model.fit(X)
+
+    dist = model.prior_estimator_.return_distribution_
+
+    ptf1 = model.predict(X)
+    ptf2 = model.predict(dist)
+    np.testing.assert_almost_equal(ptf1.returns, ptf2.returns)
+    np.testing.assert_array_equal(ptf1.assets, ptf2.assets)
+
+    model.fit(np.array(X))
+    ptf1 = model.predict(np.array(X))
+    ptf2 = model.predict(dist)
+    np.testing.assert_almost_equal(ptf1.returns, ptf2.returns)
+    np.testing.assert_array_equal(ptf1.assets, ptf2.assets)

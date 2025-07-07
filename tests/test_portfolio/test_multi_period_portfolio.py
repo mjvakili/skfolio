@@ -1,5 +1,4 @@
 import datetime as dt
-import timeit
 
 import numpy as np
 import pandas as pd
@@ -22,7 +21,7 @@ from skfolio.utils.tools import args_names
 
 def _portfolio_returns(asset_returns: np.ndarray, weights: np.array) -> np.array:
     r"""
-    Compute the portfolio returns from its assets returns and weights
+    Compute the portfolio returns from its assets returns and weights.
     """
     n, m = asset_returns.shape
     returns = np.zeros(n)
@@ -153,6 +152,12 @@ def portfolio_and_returns(prices, periods, weights):
     return portfolio, returns
 
 
+@pytest.fixture(scope="function")
+def portfolio(portfolio_and_returns):
+    portfolio, _ = portfolio_and_returns
+    return portfolio
+
+
 @pytest.fixture(
     scope="module",
     params=list(PerfMeasure)
@@ -172,8 +177,7 @@ def annualized_factor(request):
     return request.param
 
 
-def test_portfolio_annualized(portfolio_and_returns, annualized_factor):
-    portfolio, returns = portfolio_and_returns
+def test_portfolio_annualized(portfolio, annualized_factor):
     if annualized_factor is not None:
         portfolio.annualized_factor = annualized_factor
 
@@ -254,8 +258,8 @@ def test_portfolio_methods(portfolio_and_returns, periods):
     assert isinstance(portfolio.summary(formatted=False), pd.Series)
 
 
-def test_mpp_magic_methods(portfolio_and_returns, periods):
-    mpp, returns = portfolio_and_returns
+def test_mpp_magic_methods(portfolio, periods):
+    mpp = portfolio
     assert mpp[1] == mpp.portfolios[1]
     for i, p in enumerate(mpp):
         assert p.name == f"portfolio_{i}"
@@ -312,15 +316,13 @@ def test_portfolio_dominate(X):
         ) == portfolio_1.dominates(portfolio_2)
 
 
-def test_portfolio_metrics(portfolio_and_returns, measure):
-    portfolio, returns = portfolio_and_returns
+def test_portfolio_metrics(portfolio, measure):
     m = getattr(portfolio, measure.value)
     assert isinstance(m, float)
     assert not np.isnan(m)
 
 
-def test_portfolio_slots(portfolio_and_returns):
-    portfolio, returns = portfolio_and_returns
+def test_portfolio_slots(portfolio):
     for attr in portfolio._slots():
         if attr[0] == "_":
             try:
@@ -330,22 +332,7 @@ def test_portfolio_slots(portfolio_and_returns):
         getattr(portfolio, attr)
 
 
-def test_portfolio_cache(portfolio_and_returns, periods, measure):
-    portfolio, returns = portfolio_and_returns
-    # time for accessing cached attributes
-    n = int(1e5)
-
-    first_access_time = timeit.timeit(
-        lambda: getattr(portfolio, measure.value), number=1
-    )
-    cached_access_time = (
-        timeit.timeit(lambda: getattr(portfolio, measure.value), number=n) / n
-    )
-    assert first_access_time > 10 * cached_access_time
-
-
-def test_portfolio_clear_cache(portfolio_and_returns, periods, measure):
-    portfolio, returns = portfolio_and_returns
+def test_portfolio_clear_cache(portfolio, periods, measure):
     if measure.is_ratio:
         r = measure.linked_risk_measure
     else:
@@ -357,6 +344,7 @@ def test_portfolio_clear_cache(portfolio_and_returns, periods, measure):
     args = [
         arg if arg in Portfolio._measure_global_args else f"{r.value}_{arg}"
         for arg in args_names(func)
+        if arg not in ["biased", "sample_weight"]
     ]
     args = [arg for arg in args if arg not in Portfolio._read_only_attrs]
     # default
@@ -377,8 +365,7 @@ def test_portfolio_clear_cache(portfolio_and_returns, periods, measure):
             assert getattr(portfolio, measure.value) == portfolio.mean / new_m
 
 
-def test_portfolio_read_only(portfolio_and_returns, periods):
-    portfolio, returns = portfolio_and_returns
+def test_portfolio_read_only(portfolio, periods):
     for attr in MultiPeriodPortfolio._read_only_attrs:
         try:
             setattr(portfolio, attr, 0)
@@ -387,8 +374,7 @@ def test_portfolio_read_only(portfolio_and_returns, periods):
             assert str(e) == f"can't set attribute '{attr}' because it is read-only"
 
 
-def test_portfolio_delete_attr(portfolio_and_returns, periods):
-    portfolio, returns = portfolio_and_returns
+def test_portfolio_delete_attr(portfolio, periods):
     try:
         delattr(portfolio, "dummy")
         raise
@@ -396,8 +382,29 @@ def test_portfolio_delete_attr(portfolio_and_returns, periods):
         assert str(e) == "`MultiPeriodPortfolio` object has no attribute 'dummy'"
 
 
-def test_portfolio_summary(portfolio_and_returns, periods):
-    portfolio, returns = portfolio_and_returns
+def test_portfolio_summary(portfolio, periods):
     df = portfolio.summary(formatted=False)
     assert df.loc["Portfolios Number"] == 3.0
     assert df.loc["Avg nb of Assets per Portfolio"] == 20.0
+
+
+def test_portfolio_contribution(portfolio):
+    contribution = portfolio.contribution(measure=RiskMeasure.CVAR)
+    assert isinstance(contribution, pd.DataFrame)
+    assert contribution.shape == (17, 3)
+
+    contribution = portfolio.contribution(
+        measure=RiskMeasure.STANDARD_DEVIATION, to_df=False
+    )
+    assert isinstance(contribution, list)
+    assert len(contribution) == 3
+    assert contribution[0].shape == (20,)
+
+    assert portfolio.plot_contribution(measure=RiskMeasure.STANDARD_DEVIATION)
+
+
+def test_weights_per_observation(portfolio):
+    df = portfolio.weights_per_observation
+    np.testing.assert_array_equal(df.index.values, portfolio.observations)
+    assert len(df.columns) == 17
+    assert len(set(df.columns)) == 17

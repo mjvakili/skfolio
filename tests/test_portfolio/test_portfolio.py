@@ -88,13 +88,21 @@ def annualized_factor(request):
 
 def _portfolio_returns(asset_returns: np.ndarray, weights: np.array) -> np.array:
     r"""
-    Compute the portfolio returns from its assets returns and weights
+    Compute the portfolio returns from its assets returns and weights.
     """
     n, m = asset_returns.shape
     returns = np.zeros(n)
     for i in range(m):
         returns += asset_returns[:, i] * weights[i]
     return returns
+
+
+@pytest.fixture(scope="module")
+def sample_weight(X):
+    rng = np.random.default_rng(42)
+    sample_weight = rng.random(len(X))
+    sample_weight /= sample_weight.sum()
+    return sample_weight
 
 
 def test_pickle(portfolio):
@@ -229,6 +237,7 @@ def test_portfolio_methods(X, weights):
     assert np.array_equal(names_1, names_2)
     portfolio.clear()
     assert portfolio.plot_returns()
+    assert portfolio.plot_returns_distribution()
     assert portfolio.plot_cumulative_returns()
     assert portfolio.plot_rolling_measure(measure=RatioMeasure.SHARPE_RATIO, window=20)
     assert isinstance(portfolio.composition, pd.DataFrame)
@@ -299,13 +308,6 @@ def test_portfolio_dominate(X):
         ) == portfolio_1.dominates(portfolio_2)
 
 
-def test_portfolio_risk_contribution(X, weights):
-    portfolio = Portfolio(X=X, weights=weights, annualized_factor=252)
-    contribution = portfolio.contribution(measure=RiskMeasure.CVAR)
-    # noinspection PyUnresolvedReferences
-    assert contribution.shape == (X.shape[1],)
-
-
 def test_portfolio_metrics(portfolio, measure):
     m = getattr(portfolio, measure.value)
     assert isinstance(m, float)
@@ -342,11 +344,8 @@ def test_portfolio_slots(X, weights):
 
 def test_copy(X, weights):
     portfolio = Portfolio(X=X, weights=weights, annualized_factor=252)
-    try:
+    with pytest.raises(AttributeError):
         _ = portfolio._assets_names
-        raise
-    except AttributeError:
-        pass
     _ = portfolio.nonzero_assets
     _ = copy(portfolio)
 
@@ -379,6 +378,7 @@ def test_portfolio_clear_cache(X, weights, measure):
     args = [
         arg if arg in Portfolio._measure_global_args else f"{r.value}_{arg}"
         for arg in args_names(func)
+        if arg not in ["biased", "sample_weight"]
     ]
     args = [arg for arg in args if arg not in Portfolio._read_only_attrs]
     # default
@@ -460,3 +460,53 @@ def test_portfolio_plot_cumulative_returns(X, weights):
     portfolio.compounded = True
     assert portfolio.plot_cumulative_returns()
     assert portfolio.plot_cumulative_returns(log_scale=True)
+
+
+def test_portfolio_contribution(portfolio):
+    contribution = portfolio.contribution(measure=RiskMeasure.CVAR, to_df=True)
+    assert isinstance(contribution, pd.DataFrame)
+    assert contribution.shape == (10, 1)
+    assert np.isclose(contribution.sum().sum(), portfolio.cvar)
+
+    contribution = portfolio.contribution(measure=RiskMeasure.STANDARD_DEVIATION)
+    assert isinstance(contribution, np.ndarray)
+    assert contribution.shape == (20,)
+
+    assert np.isclose(np.sum(contribution), portfolio.standard_deviation)
+
+    assert portfolio.plot_contribution(measure=RiskMeasure.STANDARD_DEVIATION)
+
+
+def test_weights_per_observation(portfolio):
+    df = portfolio.weights_per_observation
+    np.testing.assert_array_equal(df.index.values, portfolio.observations)
+    assert len(df.columns) == 10
+    np.testing.assert_array_equal(df.columns.values, portfolio.nonzero_assets)
+    np.testing.assert_array_equal(
+        df.values[0], portfolio.weights[portfolio.nonzero_assets_index]
+    )
+
+
+def test_sample_weight(portfolio, sample_weight):
+    ref = portfolio.cvar
+    portfolio.sample_weight = np.ones(len(sample_weight)) / len(sample_weight)
+    v1 = portfolio.cvar
+    np.testing.assert_almost_equal(ref, v1)
+    portfolio.sample_weight = sample_weight
+    v2 = portfolio.cvar
+    _ = portfolio.summary()
+    assert abs(v1 - v2) > 0.001
+    portfolio.sample_weight = None
+    v3 = portfolio.cvar
+    np.testing.assert_almost_equal(ref, v3)
+
+
+def test_sample_weight_error(portfolio, sample_weight):
+    with pytest.raises(ValueError, match="sample_weight must have the same length as"):
+        portfolio.sample_weight = np.ones(5)
+
+    with pytest.raises(ValueError, match="sample_weight must sum to one"):
+        portfolio.sample_weight = np.ones(len(sample_weight))
+
+    with pytest.raises(ValueError, match="sample_weight must be a 1D array"):
+        portfolio.sample_weight = [[1]]
